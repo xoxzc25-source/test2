@@ -1,4 +1,18 @@
--- MONOCHROME_PREMIUM // v65.0 RICK PRIME AUTOMATIC BIOPRINTER CORE
+-- MONOCHROME_PREMIUM // v65.3 RICK PRIME AUTOMATIC BIOPRINTER CORE
+-- Изменения v65.3:
+--   * НЕРВЫ: откат к ЧИСТОЙ сети v65.1 — убраны ветвления и неоновые
+--     синапсы («палочки с шариками»), убран слайдер детальности
+--   * НОВОЕ: РЕЗЕРВНЫЙ ПРОТОКОЛ — спасение при критическом ХП
+--     (+40% макс.ХП, кулдаун 90 сек). Преимущество есть, чита нет:
+--     каноничная фишка Прайма — у него всегда есть запасной план
+--   * КОСТЬ v2 остаётся: эпифизы, вторая кость, гребни, грудина
+-- Изменения v65.2:
+--   * КОСТЬ v2: эпифизы (суставные головы), ВТОРАЯ КОСТЬ (лучевая),
+--     межкостные гребни; у торса — ГРУДИНА в грудной клетке
+-- Изменения v65.1:
+--   * ЗВУК РАСПАДА: играет ТОЛЬКО после телепорта на место распада
+--   * ЗВУК ГЕНЕРАЦИИ: ОДИН общий слой — даже при 5 параллельных печатях
+--   * МЕНЮ: глубокая тёмно-красная палитра Prime, убран кислотный неон
 -- Изменения v65.0:
 --   * ЗВУКИ: распад (104144683858662) + генерация (129340282352270,
 --     замедляется ровно под длительность печати и зацикливается)
@@ -46,8 +60,11 @@ end
 getgenv().PrimePrinterConfig = {
     AutoRegen = true,          -- авто-регенерация конечности при получении урона (без лимита!)
     AutoShatter = true,        -- авто-распад на части при низком ХП
-    ShatterHP = 20,           -- порог ХП, ниже которого срабатывает распад
-    WalkSpeedValue = 16,
+    ShatterHP = 20,            -- порог ХП, ниже которого срабатывает распад
+    SecondWind = true,         -- РЕЗЕРВНЫЙ ПРОТОКОЛ: спасение при критическом ХП
+    SecondWindHP = 25,         -- порог ХП для срабатывания резервного протокола
+    SecondWindHeal = 0.4,      -- сколько макс.ХП восстанавливать (0.4 = 40%)
+    SecondWindCD = 90,         -- кулдаун резервного протокола (сек)
     RegenSpeed = 1.0
 }
 local config = getgenv().PrimePrinterConfig
@@ -60,21 +77,20 @@ local FLESH_FADE = 0.5
 local SKIN_FADE = 0.4
 local FLASH_TIME = 0.3
 
--- Палитра Rick Prime: тёмный графит + кровавый красный.
--- Кислотно-зелёный из МЕНЮ убран (мозолит глаза); вспышки в МИРЕ
--- остаются портально-зелёными, как порталы Рика.
-local COLOR_BG        = Color3.fromRGB(10, 10, 12)
-local COLOR_PANEL     = Color3.fromRGB(18, 18, 20)
+-- Палитра Rick Prime: глубокий графит + сдержанный кровавый красный.
+-- Вспышки в МИРЕ остаются портально-зелёными, как порталы Рика.
+local COLOR_BG        = Color3.fromRGB(8, 8, 10)
+local COLOR_PANEL     = Color3.fromRGB(16, 16, 18)
 local COLOR_HEADER    = Color3.fromRGB(30, 12, 14)
-local COLOR_NEON      = Color3.fromRGB(255, 55, 55)   -- Prime Red: главный акцент меню
-local COLOR_NEON_DIM  = Color3.fromRGB(150, 40, 40)
+local COLOR_NEON      = Color3.fromRGB(185, 40, 40)   -- Prime Red: глубокий, НЕ кислотный
+local COLOR_NEON_DIM  = Color3.fromRGB(110, 28, 28)
 local COLOR_TEXT      = Color3.fromRGB(215, 212, 212)
-local COLOR_PRIME_RED = Color3.fromRGB(255, 45, 45)   -- «злой» акцент Rick Prime
-local COLOR_FLASH_IN  = Color3.fromRGB(0, 255, 65)   -- вспышки в мире — зелёные
+local COLOR_PRIME_RED = Color3.fromRGB(205, 45, 45)   -- сдержанный «злой» акцент Rick Prime
+local COLOR_FLASH_IN  = Color3.fromRGB(0, 255, 65)    -- вспышки в мире — зелёные
 local COLOR_FLASH_OUT = Color3.fromRGB(160, 255, 190)
 
 local BONE_COLOR       = Color3.fromRGB(240, 235, 220)
-local NERVE_COLOR      = Color3.fromRGB(225, 200, 175) -- нервный ствол: тёплый телесный оттенок (не как кость)
+local NERVE_COLOR      = Color3.fromRGB(225, 200, 175) -- нервный ствол: тёплый телесный оттенок
 local NERVE_NODE_COLOR = Color3.fromRGB(195, 170, 150) -- ганглии темнее ствола
 local ARTERY_COLOR     = Color3.fromRGB(200, 35, 30)   -- артерии: ярко-красные
 local VEIN_COLOR       = Color3.fromRGB(55, 85, 200)   -- вены: синие
@@ -108,6 +124,7 @@ getgenv().activePrinterParts = {}
 getgenv().ShatterActive = false
 getgenv().ActivePrintSound = nil
 getgenv().PrintSoundUsers = 0
+getgenv().SecondWindReadyAt = 0 -- момент, когда резервный протокол снова готов
 
 -- Хук статуса: меню подписывается на него, чтобы показывать ход печати
 getgenv().PrinterStatusCallback = nil
@@ -160,13 +177,13 @@ end
 local function endPrintSound()
     local n = (getgenv().PrintSoundUsers or 1) - 1
     if n <= 0 then
+        getgenv().PrintSoundUsers = 0
         local s = getgenv().ActivePrintSound
         if s then
-            s:Stop()
-            s:Destroy()
+            pcall(function() s:Stop() end)
+            pcall(function() s:Destroy() end)
         end
         getgenv().ActivePrintSound = nil
-        getgenv().PrintSoundUsers = 0
     else
         getgenv().PrintSoundUsers = n
     end
@@ -233,7 +250,7 @@ end
 -- Деталь на растущей части: сидит на высоте frac по оси роста host-части
 -- (0.5 = верх, 0 = центр, -0.5 = низ). Появляется плавным проявлением.
 -- axis = "Y" (обычная часть) или "X" (кость-цилиндр).
--- rot — поворот детали (для рёбер торса).
+-- rot — поворот/смещение детали (рёбра, гребни).
 local function bioNode(name, size, color, material, duration, host, frac, finalTransparency, isBall, axis, limbTag, rot)
     local char = LocalPlayer.Character
     if not char or not host then return nil end
@@ -279,8 +296,11 @@ local function bioNode(name, size, color, material, duration, host, frac, finalT
     return part
 end
 
--- НЕРВНО-СОСУДИСТАЯ СЕТЬ — как в реальной конечности: бледные нервные
--- стволы с ганглиями, красные артерии, синие вены и россыпь капилляров.
+-- =====================================================================
+-- НЕРВНО-СОСУДИСТАЯ СЕТЬ — ЧИСТАЯ версия (v65.1): 4 нервных ствола
+-- с ганглиями, красные артерии, синие вены, 6 капилляров и перемычки
+-- на кости. Без ветвлений и неона.
+-- =====================================================================
 local function buildNerveSystem(anchorPart, boneLen, boneDiameter, bone, topOffset, limbTag)
     local rNerve = boneDiameter / 2 + 0.05
     local rBlood = boneDiameter / 2 + 0.03
@@ -341,8 +361,7 @@ local function buildNerveSystem(anchorPart, boneLen, boneDiameter, bone, topOffs
         )
     end
 
-    -- 4) капилляры: МНОГО тонких струн, красные и синие вперемешку,
-    -- разной длины — органическая россыпь
+    -- 4) капилляры: тонкие струны по кругу, красные и синие вперемешку
     for i = 1, 6 do
         local angle = (i - 1) * math.pi / 3 + math.pi / 12
         local capColor = (i % 2 == 0) and ARTERY_COLOR or VEIN_COLOR
@@ -464,10 +483,10 @@ local function runPrintSequence(limbName, parts)
         -- ЗВУК ГЕНЕРАЦИИ: замедляем трек ровно под длительность печати
         -- (трек 1 сек → PlaybackSpeed 1/totalTime; на случай лагов — цикл)
         local totalTime = (VANISH_TIME + BONE_FADE + NERVE_FADE + FLESH_FADE + SKIN_FADE + 0.1) * speed
-        local printSound = playSoundAt(anchorPart, PRINT_SOUND_ID, 1, math.clamp(1 / totalTime, 0.3, 1.25), true)
+        -- звук генерации: общий на ВСЕ параллельные печати (один слой)
+        startPrintSound(anchorPart, totalTime)
 
         -- Свежий снимок кожи: берём ТЕКУЩИЙ цвет/материал прямо перед печатью
-        -- (захват при спавне мог быть серым дефолтом до прогрузки аватара).
         for _, p in ipairs(parts) do
             getgenv().originalDataRef[p] = {Color = p.Color, Material = p.Material, Transparency = p.Transparency}
         end
@@ -479,7 +498,7 @@ local function runPrintSequence(limbName, parts)
         end
         task.wait(VANISH_TIME * speed)
 
-        -- ФАЗА 1: КОСТЬ — сплошной цилиндр (трубчатая кость)
+        -- ФАЗА 1: КОСТЬ v2 — главный shaft (трубчатая кость)
         local boneLen = originalSize.Y * 0.98
         -- торсу — более мощный ПОЗВОНОЧНИК
         local boneDiameter = math.min(originalSize.X, originalSize.Z) * ((limbName == "Torso") and 0.38 or 0.3)
@@ -495,26 +514,65 @@ local function runPrintSequence(limbName, parts)
             true,
             limbName
         )
-        -- ТОРС: ГРУДНАЯ КЛЕТКА — 4 пары рёбер, растущих из позвоночника
-        -- вниз и в стороны (как настоящие рёбра)
-        if limbName == "Torso" and bone then
-            local ribLen = originalSize.X * 0.32
-            local ribFracs = {0.32, 0.12, -0.08, -0.28}
-            for _, f in ipairs(ribFracs) do
-                bioNode("Rib_R", Vector3.new(ribLen, 0.05, 0.04), BONE_COLOR, Enum.Material.Slate, BONE_FADE, bone, f, 0, false, "X", limbName, CFrame.Angles(0, 0, math.rad(-130)) * CFrame.new(ribLen / 2, 0, 0))
-                bioNode("Rib_L", Vector3.new(ribLen, 0.05, 0.04), BONE_COLOR, Enum.Material.Slate, BONE_FADE, bone, f, 0, false, "X", limbName, CFrame.Angles(0, 0, math.rad(130)) * CFrame.new(ribLen / 2, 0, 0))
+
+        if bone then
+            if limbName == "Torso" then
+                -- ТОРС: ГРУДНАЯ КЛЕТКА — 4 пары рёбер из позвоночника
+                local ribLen = originalSize.X * 0.32
+                local ribFracs = {0.32, 0.12, -0.08, -0.28}
+                for _, f in ipairs(ribFracs) do
+                    bioNode("Rib_R", Vector3.new(ribLen, 0.05, 0.04), BONE_COLOR, Enum.Material.Slate, BONE_FADE, bone, f, 0, false, "X", limbName, CFrame.Angles(0, 0, math.rad(-130)) * CFrame.new(ribLen / 2, 0, 0))
+                    bioNode("Rib_L", Vector3.new(ribLen, 0.05, 0.04), BONE_COLOR, Enum.Material.Slate, BONE_FADE, bone, f, 0, false, "X", limbName, CFrame.Angles(0, 0, math.rad(130)) * CFrame.new(ribLen / 2, 0, 0))
+                end
+                -- ГРУДИНА: вертикальная пластина спереди грудной клетки
+                bioPart(
+                    "Sternum",
+                    Vector3.new(0.1, originalSize.Y * 0.45, originalSize.Z * 0.13),
+                    BONE_COLOR,
+                    Enum.Material.Slate,
+                    BONE_FADE,
+                    anchorPart,
+                    topOffset * CFrame.new(0, 0, originalSize.Z / 2 - 0.06),
+                    0,
+                    false,
+                    limbName
+                )
+            else
+                -- КОНЕЧНОСТЬ v2:
+                -- Эпифизы: округлые суставные головы на концах кости
+                local epi = boneDiameter * 1.3
+                bioNode("BoneEpi_Top", Vector3.new(epi, epi, epi), BONE_COLOR, Enum.Material.Slate, BONE_FADE, bone, 0.5, 0, true, "X", limbName)
+                bioNode("BoneEpi_Bot", Vector3.new(epi, epi, epi), BONE_COLOR, Enum.Material.Slate, BONE_FADE, bone, -0.5, 0, true, "X", limbName)
+                -- ВТОРАЯ КОСТЬ (лучевая/локтевая): параллельно, тоньше и короче
+                local bone2D = boneDiameter * 0.55
+                bioPart(
+                    "Bone2",
+                    Vector3.new(boneLen * 0.92, bone2D, bone2D),
+                    BONE_COLOR,
+                    Enum.Material.Slate,
+                    BONE_FADE,
+                    anchorPart,
+                    topOffset * CFrame.new(0, 0, boneDiameter / 2 + bone2D / 2 + 0.02),
+                    0,
+                    true,
+                    limbName
+                )
+                -- Межкостные гребни: продольные кили вдоль диафиза
+                local ridgeLen = boneLen * 0.72
+                bioNode("BoneRidge", Vector3.new(ridgeLen, 0.05, 0.05), BONE_COLOR, Enum.Material.Slate, BONE_FADE, bone, 0.06, 0, false, "X", limbName, CFrame.new(0, boneDiameter / 2 + 0.02, 0))
+                bioNode("BoneRidge", Vector3.new(ridgeLen, 0.05, 0.05), BONE_COLOR, Enum.Material.Slate, BONE_FADE, bone, -0.06, 0, false, "X", limbName, CFrame.new(0, -boneDiameter / 2 - 0.02, 0))
             end
         end
         setPrinterStatus("ПЕЧАТЬ: " .. limbName .. " // КОСТЬ")
         task.wait(BONE_FADE * speed)
 
-        -- ФАЗА 2: НЕРВЫ — стволы, артерии, вены, капилляры
+        -- ФАЗА 2: НЕРВЫ — чистая сеть: стволы + ганглии, артерии, вены,
+        -- капилляры, перемычки (без ветвлений и неона, v65.3)
         buildNerveSystem(anchorPart, boneLen, boneDiameter, bone, topOffset, limbName)
         setPrinterStatus("ПЕЧАТЬ: " .. limbName .. " // НЕРВЫ")
         task.wait(NERVE_FADE * speed)
 
-        -- ФАЗА 3: МЫШЦЫ — НЕПРОЗРАЧНАЯ красная плоть + яркие волокна,
-        -- чуть выступающие рельефом на поверхности (мышечные тяжи)
+        -- ФАЗА 3: МЫШЦЫ — НЕПРОЗРАЧНАЯ красная плоть + яркие волокна
         local fleshSize = originalSize * 0.96
         bioPart("Flesh", fleshSize, FLESH_COLOR, Enum.Material.SmoothPlastic, FLESH_FADE, anchorPart, topOffset, 0, false, limbName)
         local fiberR = fleshSize.X / 2 - 0.02
@@ -566,11 +624,8 @@ local function runPrintSequence(limbName, parts)
             end
         end
 
-        -- звук генерации — стоп
-        if printSound then
-            printSound:Stop()
-            printSound:Destroy()
-        end
+        -- звук генерации: снимаем нашего "слушателя" — глохнет, когда закончили ВСЕ
+        endPrintSound()
 
         for _, p in ipairs(parts) do
             p.Transparency = 0
@@ -626,8 +681,8 @@ end
 -- =====================================================================
 -- РАСПАД НА ЧАСТИ: тело разлетается с кровью (настоящая физика — куски
 -- ПАДАЮТ на землю), происходит РЕСЕТ (смерть+респавн), персонаж
--- ВОЗРОЖДАЕТСЯ НА ТОМ ЖЕ МЕСТЕ, где распался, и полностью регенерирует:
--- торс + все 4 конечности.
+-- ВОЗРОЖДАЕТСЯ НА ТОМ ЖЕ МЕСТЕ, где распался, и полностью регенерирует.
+-- ЗВУК РАСПАДА: играет ТОЛЬКО после телепорта на место распада.
 -- =====================================================================
 getgenv().shatterBody = function()
     if getgenv().ShatterActive then return end
@@ -643,11 +698,7 @@ getgenv().shatterBody = function()
         local deathCF = root.CFrame -- запоминаем ГДЕ распались
         local rootPos = root.Position
 
-        -- ЗВУК РАСПАДА
-        playSoundAt(root, SHATTER_SOUND_ID, 2, 1, false)
-
         -- 1) ФИЗИЧЕСКИЕ копии всех видимых частей: разлетаются с брызгами крови
-        --    и САМИ ПАДАЮТ на землю (настоящая физика, без левитации)
         local clones = {}
         for _, obj in ipairs(char:GetDescendants()) do
             if obj:IsA("BasePart") and obj.Name ~= "HumanoidRootPart" and obj.Transparency < 1 then
@@ -670,8 +721,7 @@ getgenv().shatterBody = function()
             end
         end
 
-        -- 2) прячем настоящее тело и снимаем коллизии,
-        --    чтобы невидимый труп не мешал разлетевшимся кускам
+        -- 2) прячем настоящее тело и снимаем коллизии
         for _, obj in ipairs(char:GetDescendants()) do
             if obj:IsA("BasePart") then
                 obj.Transparency = 1
@@ -681,7 +731,7 @@ getgenv().shatterBody = function()
             end
         end
 
-        -- 3) РЕСЕТ: убиваем персонажа — игра делает респавн сама
+        -- 3) РЕСЕТ: убиваем персонажа — игра делает респавн сама (БЕЗ звука)
         setPrinterStatus("ОЖИДАНИЕ РЕСПАВНА...")
         hum.Health = 0
         hum:ChangeState(Enum.HumanoidStateType.Dead)
@@ -707,6 +757,8 @@ getgenv().shatterBody = function()
                 task.wait(0.25)
                 newRoot.CFrame = deathCF -- повторно: если игра телепортнула на спавн
                 spawnPortalFlash(newRoot, COLOR_FLASH_OUT)
+                -- ЗВУК РАСПАДА: играет ТОЛЬКО сейчас — мы тепнулись на место распада
+                playSoundAt(newRoot, SHATTER_SOUND_ID, 2, 1, false)
             end
         end
 
@@ -764,25 +816,48 @@ local function setupCharacter(character)
         end
     end
 
-    -- применяем скорость ОДИН раз при спавне (спринт игры больше не блокируется)
-    hum.WalkSpeed = config.WalkSpeedValue
+    -- v65.2+: WalkSpeed НЕ трогаем ВООБЩЕ — скорость и спринт игры как есть
 
     local previousHealth = hum.Health
     track(hum.HealthChanged:Connect(function(newHealth)
+        local tookDamage = newHealth < previousHealth
+
+        -- РЕЗЕРВНЫЙ ПРОТОКОЛ (v65.3): спасение при критическом ХП.
+        -- Преимущество честное: раз в кулдаун, по порогу, без бессмертия.
+        -- Канон Прайма — у оригинала всегда есть запасной план.
+        if tookDamage and newHealth > 0 and config.SecondWind
+            and not getgenv().ShatterActive
+            and newHealth <= config.SecondWindHP then
+            if os.clock() >= (getgenv().SecondWindReadyAt or 0) then
+                getgenv().SecondWindReadyAt = os.clock() + (config.SecondWindCD or 90)
+                local heal = (hum.MaxHealth or 100) * (config.SecondWindHeal or 0.4)
+                hum.Health = math.min(hum.MaxHealth or 100, newHealth + heal)
+                local rootSW = character:FindFirstChild("HumanoidRootPart")
+                if rootSW then
+                    playSoundAt(rootSW, PRINT_SOUND_ID, 1, 1.5, false) -- быстрый «перезапуск»
+                end
+                setPrinterStatus("🧬 РЕЗЕРВНЫЙ ПРОТОКОЛ: +" .. math.floor(heal) .. " HP")
+            else
+                local left = math.ceil((getgenv().SecondWindReadyAt or 0) - os.clock())
+                setPrinterStatus("РЕЗЕРВНЫЙ ПРОТОКОЛ: ПЕРЕЗАРЯДКА " .. left .. "с")
+            end
+        end
+
         -- АВТО-РАСПАД при низком ХП
         if config.AutoShatter and getgenv().shatterBody
             and newHealth > 0 and newHealth <= config.ShatterHP
             and not getgenv().ShatterActive then
             getgenv().shatterBody()
         end
+
         -- АВТО-РЕГЕН при уроне: лимита нет — каждая пуля может запустить свою конечность
-        if newHealth < previousHealth and newHealth > 0 and config.AutoRegen then
+        if tookDamage and newHealth > 0 and config.AutoRegen then
             local limb = pickRandomFreeLimb()
             if limb and getgenv().regenerateLimb then
                 getgenv().regenerateLimb(limb)
             end
         end
-        previousHealth = newHealth
+        previousHealth = hum.Health
     end))
 end
 
@@ -790,8 +865,7 @@ if LocalPlayer.Character then setupCharacter(LocalPlayer.Character) end
 track(LocalPlayer.CharacterAdded:Connect(setupCharacter))
 
 -- Heartbeat: ТОЛЬКО доводка Weld'ов (верх принта прижат к конечности,
--- часть растёт вниз; утолщения нервов скользят по растущим стволам).
--- ВАЖНО: WalkSpeed здесь больше не трогаем — иначе ломается спринт на Shift!
+-- часть растёт вниз; узлы скользят по растущим частям).
 track(RunService.Heartbeat:Connect(function()
     local list = getgenv().activePrinterParts
     if #list > 0 then
@@ -805,7 +879,6 @@ track(RunService.Heartbeat:Connect(function()
                 elseif data.Mode == "Node" and data.Host and data.Host.Parent then
                     local rot = data.Rot or CFrame.new()
                     if data.Axis == "X" then
-                        -- кость-цилиндр: ось роста = локальная X, верх = +X
                         data.Weld.C0 = CFrame.new(data.Host.Size.X * data.Frac, 0, 0) * rot
                     else
                         data.Weld.C0 = CFrame.new(0, data.Host.Size.Y * data.Frac, 0) * rot
@@ -816,7 +889,7 @@ track(RunService.Heartbeat:Connect(function()
     end
 end))
 
--- ===================== RICK PRIME GUI =====================
+-- ===================== RICK PRIME GUI (v65.3) =====================
 
 local mG = Instance.new("ScreenGui", CoreGui)
 mG.Name = "MonoPortalGunGui"
@@ -849,11 +922,11 @@ title.Text, title.TextColor3, title.Font, title.TextSize, title.TextXAlignment, 
 local subtitle = Instance.new("TextLabel", mF)
 subtitle.Size, subtitle.Position, subtitle.BackgroundTransparency = UDim2.new(1, -60, 0, 14), UDim2.new(0, 14, 0, 24), 1
 subtitle.Text, subtitle.TextColor3, subtitle.Font, subtitle.TextSize, subtitle.TextXAlignment, subtitle.ZIndex =
-    "RICK PRIME // DARK PROTOCOL // v65.0", Color3.fromRGB(255, 70, 70), Enum.Font.Code, 8, Enum.TextXAlignment.Left, 3
+    "RICK PRIME // DARK PROTOCOL // v65.3", Color3.fromRGB(205, 75, 75), Enum.Font.Code, 8, Enum.TextXAlignment.Left, 3
 
--- Пульсация заголовка (портальное свечение)
+-- Пульсация заголовка (сдержанная, НЕ кислотная)
 TweenService:Create(title, TweenInfo.new(1.2, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true),
-    {TextColor3 = Color3.fromRGB(255, 130, 130)}):Play()
+    {TextColor3 = Color3.fromRGB(235, 95, 95)}):Play()
 
 -- Закрытие
 local close = Instance.new("TextButton", mF)
@@ -886,7 +959,7 @@ statusLabel.Text, statusLabel.TextColor3, statusLabel.Font, statusLabel.TextSize
 getgenv().PrinterStatusCallback = function(text)
     statusLabel.Text = "▮ СТАТУС: " .. text
     if string.find(text, "РАСПАД") or string.find(text, "РЕСПАВН") or string.find(text, "ОШИБКА") then
-        statusDot.BackgroundColor3 = Color3.fromRGB(255, 255, 255) -- распад: белый сигнал
+        statusDot.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
     else
         statusDot.BackgroundColor3 = (text == "ОЖИДАНИЕ") and COLOR_NEON_DIM or COLOR_NEON
     end
@@ -960,6 +1033,9 @@ end)
 mkToggle("[◉ ВКЛ]  АВТО-РАСПАД ПРИ НИЗКОМ ХП", "[○ ВЫКЛ]  АВТО-РАСПАД ПРИ НИЗКОМ ХП",
     118, function() return config.AutoShatter end, function(v) config.AutoShatter = v end)
 
+mkToggle("[◉ ВКЛ]  РЕЗЕРВНЫЙ ПРОТОКОЛ (СПАСЕНИЕ НА 40% ХП)", "[○ ВЫКЛ]  РЕЗЕРВНЫЙ ПРОТОКОЛ (СПАСЕНИЕ НА 40% ХП)",
+    156, function() return config.SecondWind end, function(v) config.SecondWind = v end)
+
 -- Слайдеры
 local activeSliders = {}
 
@@ -985,7 +1061,7 @@ local function createSlider(text, y, min, max, default, isInt, cb)
     dot.BackgroundColor3, dot.BorderSizePixel, dot.Text, dot.ZIndex = COLOR_NEON, 0, "", 6
     Instance.new("UICorner", dot).CornerRadius = UDim.new(1, 0)
     local initPct = math.clamp((default - min) / (max - min), 0, 1)
-    dot.Position = UDim2.new(0, 4 + (initPct * 258), 0, y + 15) -- 258 = ширина трека (268) минус диаметр точки (10)
+    dot.Position = UDim2.new(0, 4 + (initPct * 258), 0, y + 15)
 
     local sliderData = {
         Dragging = false, Button = dot, Bar = fill, BG = line,
@@ -1027,21 +1103,11 @@ track(UserInputService.InputChanged:Connect(function(input)
     end
 end))
 
-createSlider("ЗАМЕДЛЕНИЕ СКОРОСТИ ПЕЧАТИ", 158, 1, 8, config.RegenSpeed, false, function(v)
+createSlider("ЗАМЕДЛЕНИЕ СКОРОСТИ ПЕЧАТИ", 196, 1, 8, config.RegenSpeed, false, function(v)
     config.RegenSpeed = v
 end)
 
-createSlider("СКОРОСТЬ ПЕРЕМЕЩЕНИЯ РИКА", 204, 16, 150, config.WalkSpeedValue, true, function(v)
-    config.WalkSpeedValue = math.floor(v)
-    -- применяем СРАЗУ при изменении слайдера (не каждый кадр — спринт не ломаем)
-    local char = LocalPlayer.Character
-    local hum = char and char:FindFirstChildOfClass("Humanoid")
-    if hum and hum.Health > 0 then
-        hum.WalkSpeed = config.WalkSpeedValue
-    end
-end)
-
-createSlider("ПОРОГ ХП ДЛЯ АВТО-РАСПАДА", 250, 5, 100, config.ShatterHP, true, function(v)
+createSlider("ПОРОГ ХП ДЛЯ АВТО-РАСПАДА", 236, 5, 100, config.ShatterHP, true, function(v)
     config.ShatterHP = math.floor(v)
 end)
 
@@ -1049,6 +1115,6 @@ end)
 local footer = Instance.new("TextLabel", mF)
 footer.Size, footer.Position, footer.BackgroundTransparency = UDim2.new(1, -20, 0, 16), UDim2.new(0, 10, 1, -22), 1
 footer.Text, footer.TextColor3, footer.Font, footer.TextSize, footer.TextXAlignment, footer.ZIndex =
-    "MONOCHROME_PREMIUM // PRIME PROTOCOL", Color3.fromRGB(180, 30, 30), Enum.Font.Code, 7, Enum.TextXAlignment.Right, 3
+    "MONOCHROME_PREMIUM // PRIME PROTOCOL", Color3.fromRGB(150, 35, 35), Enum.Font.Code, 7, Enum.TextXAlignment.Right, 3
 
-print("[MONO]: Rick Prime BioPrinter v65.0 // DARK PROTOCOL активирован. РАСПАД ГОТОВ.")
+print("[MONO]: Rick Prime BioPrinter v65.3 // RESERVE PROTOCOL // DARK PROTOCOL активирован.")
