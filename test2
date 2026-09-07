@@ -1,0 +1,1054 @@
+-- MONOCHROME_PREMIUM // v65.0 RICK PRIME AUTOMATIC BIOPRINTER CORE
+-- Изменения v65.0:
+--   * ЗВУКИ: распад (104144683858662) + генерация (129340282352270,
+--     замедляется ровно под длительность печати и зацикливается)
+--   * ТОРС: ГРУДНАЯ КЛЕТКА (4 пары рёбер) + мощнее позвоночник
+--   * ФИКС: перемычки нервов теперь сидят ВДОЛЬ кости, а не сбоку
+--   * МЕНЮ: стиль чистого Rick Prime — DARK PROTOCOL, без C-137,
+--     красные «злые» акценты; убрана кнопка имитации урона
+-- Изменения v64.1:
+--   * РАСПАД: куски теперь ФИЗИЧЕСКИЕ (падают на землю) + видная кровь
+--   * РАСПАД: после разрыва — настоящий РЕСЕТ (смерть+респавн) и
+--     ВОЗРОЖДЕНИЕ РОВНО НА МЕСТЕ РАСПАДА, затем полная регенерация
+--   * НОВОЕ: регенерация ТОРСА (позвоночник-цилиндр + сосуды + мышцы) —
+--     ТОЛЬКО после распада, при обычном уроне не работает
+-- Изменения v64.0:
+--   * ФИКС ШИФТА: скрипт больше не давит WalkSpeed каждый кадр — спринт игры работает
+--   * СНЯТ ЛИМИТ «1 КОНЕЧНОСТЬ»: регенерации идут ПАРАЛЛЕЛЬНО (автомат больше не мешает)
+--   * НОВОЕ: РАСПАД НА ЧАСТИ — при низком ХП тело разлетается с кровью,
+--     собирается обратно НА ТОМ ЖЕ МЕСТЕ и полностью регенерирует все конечности
+-- Наследие v63.x: кость-цилиндр, сосудисто-нервная сеть, непрозрачная плоть,
+--   фикс серой кожи, печать приварена к конечности (двигается с анимациями)
+
+local Players = game:GetService("Players")
+local CoreGui = game:GetService("CoreGui")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+
+if CoreGui:FindFirstChild("MonoPortalGunGui") then
+    CoreGui["MonoPortalGunGui"]:Destroy()
+end
+
+-- Отключаем соединения от прошлого запуска, чтобы не было дублей
+if getgenv().MonoConnections then
+    for _, conn in ipairs(getgenv().MonoConnections) do
+        if conn.Connected then conn:Disconnect() end
+    end
+end
+getgenv().MonoConnections = {}
+
+local function track(conn)
+    table.insert(getgenv().MonoConnections, conn)
+    return conn
+end
+
+getgenv().PrimePrinterConfig = {
+    AutoRegen = true,          -- авто-регенерация конечности при получении урона (без лимита!)
+    AutoShatter = true,        -- авто-распад на части при низком ХП
+    ShatterHP = 20,           -- порог ХП, ниже которого срабатывает распад
+    WalkSpeedValue = 16,
+    RegenSpeed = 1.0
+}
+local config = getgenv().PrimePrinterConfig
+local LocalPlayer = Players.LocalPlayer
+
+local VANISH_TIME = 0.15
+local BONE_FADE = 0.6
+local NERVE_FADE = 0.5
+local FLESH_FADE = 0.5
+local SKIN_FADE = 0.4
+local FLASH_TIME = 0.3
+
+-- Палитра Rick Prime: тёмный графит + кровавый красный.
+-- Кислотно-зелёный из МЕНЮ убран (мозолит глаза); вспышки в МИРЕ
+-- остаются портально-зелёными, как порталы Рика.
+local COLOR_BG        = Color3.fromRGB(10, 10, 12)
+local COLOR_PANEL     = Color3.fromRGB(18, 18, 20)
+local COLOR_HEADER    = Color3.fromRGB(30, 12, 14)
+local COLOR_NEON      = Color3.fromRGB(255, 55, 55)   -- Prime Red: главный акцент меню
+local COLOR_NEON_DIM  = Color3.fromRGB(150, 40, 40)
+local COLOR_TEXT      = Color3.fromRGB(215, 212, 212)
+local COLOR_PRIME_RED = Color3.fromRGB(255, 45, 45)   -- «злой» акцент Rick Prime
+local COLOR_FLASH_IN  = Color3.fromRGB(0, 255, 65)   -- вспышки в мире — зелёные
+local COLOR_FLASH_OUT = Color3.fromRGB(160, 255, 190)
+
+local BONE_COLOR       = Color3.fromRGB(240, 235, 220)
+local NERVE_COLOR      = Color3.fromRGB(225, 200, 175) -- нервный ствол: тёплый телесный оттенок (не как кость)
+local NERVE_NODE_COLOR = Color3.fromRGB(195, 170, 150) -- ганглии темнее ствола
+local ARTERY_COLOR     = Color3.fromRGB(200, 35, 30)   -- артерии: ярко-красные
+local VEIN_COLOR       = Color3.fromRGB(55, 85, 200)   -- вены: синие
+local BLOOD_COLOR      = Color3.fromRGB(150, 15, 12)   -- кровь: насыщенно-красная
+local FLESH_COLOR      = Color3.fromRGB(165, 30, 25)
+local FIBER_COLOR      = Color3.fromRGB(215, 75, 50)
+
+local R6_LIMBS = {
+    RightArm = {"Right Arm"},
+    LeftArm = {"Left Arm"},
+    RightLeg = {"Right Leg"},
+    LeftLeg = {"Left Leg"}
+}
+
+local R15_LIMBS = {
+    RightArm = {"RightUpperArm", "RightLowerArm", "RightHand"},
+    LeftArm = {"LeftUpperArm", "LeftLowerArm", "LeftHand"},
+    RightLeg = {"RightUpperLeg", "RightLowerLeg", "RightFoot"},
+    LeftLeg = {"LeftUpperLeg", "LeftLowerLeg", "LeftFoot"}
+}
+
+-- Части торса (регенерируется ТОЛЬКО после распада на части, не при уроне)
+local TORSO_PARTS = {
+    R6  = {"Torso"},
+    R15 = {"UpperTorso", "LowerTorso"}
+}
+
+getgenv().busyLimbsRef = {}
+getgenv().originalDataRef = {}
+getgenv().activePrinterParts = {}
+getgenv().ShatterActive = false
+getgenv().ActivePrintSound = nil
+getgenv().PrintSoundUsers = 0
+
+-- Хук статуса: меню подписывается на него, чтобы показывать ход печати
+getgenv().PrinterStatusCallback = nil
+
+local function setPrinterStatus(text)
+    if getgenv().PrinterStatusCallback then
+        getgenv().PrinterStatusCallback(text)
+    end
+end
+
+-- Разворот оси X цилиндра вдоль конечности (кость-цилиндр растёт по X)
+local CYL_ROT = CFrame.Angles(0, 0, math.rad(90))
+
+-- ЗВУКИ
+local SHATTER_SOUND_ID = "rbxassetid://104144683858662" -- звук распада на части
+local PRINT_SOUND_ID   = "rbxassetid://129340282352270" -- звук генерации (1 сек)
+
+-- Проигрывает звук, привязанный к части. speed замедляет трек
+-- (длительность = 1/speed), looped — для цикла во время печати.
+local function playSoundAt(parent, id, volume, speed, looped)
+    if not parent then return nil end
+    local sound = Instance.new("Sound")
+    sound.SoundId = id
+    sound.Volume = volume or 1
+    sound.PlaybackSpeed = speed or 1
+    sound.Looped = looped or false
+    sound.Parent = parent
+    sound:Play()
+    if not looped then
+        sound.Ended:Connect(function() sound:Destroy() end)
+        task.delay(10, function()
+            if sound and sound.Parent then sound:Destroy() end
+        end)
+    end
+    return sound
+end
+
+-- ОБЩИЙ звук генерации: ОДИН на все активные печати.
+-- 5 конечностей не орут в 5 слоёв — трек просто продолжается,
+-- пока печатается хоть что-то, и глохнет, когда закончили ВСЕ.
+local function startPrintSound(parentPart, totalTime)
+    getgenv().PrintSoundUsers = (getgenv().PrintSoundUsers or 0) + 1
+    local s = getgenv().ActivePrintSound
+    if s and s.Parent then
+        return -- уже играет, второй слой не нужен
+    end
+    getgenv().ActivePrintSound = playSoundAt(parentPart, PRINT_SOUND_ID, 1, math.clamp(1 / totalTime, 0.3, 1.25), true)
+end
+
+local function endPrintSound()
+    local n = (getgenv().PrintSoundUsers or 1) - 1
+    if n <= 0 then
+        local s = getgenv().ActivePrintSound
+        if s then
+            s:Stop()
+            s:Destroy()
+        end
+        getgenv().ActivePrintSound = nil
+        getgenv().PrintSoundUsers = 0
+    else
+        getgenv().PrintSoundUsers = n
+    end
+end
+
+-- =====================================================================
+-- ЯДРО ПЕЧАТИ: всё приваривается Weld'ами к реальной (невидимой)
+-- конечности, поэтому двигается вместе с анимациями персонажа.
+-- Каждая часть помечена тегом Limb — регенерации работают ПАРАЛЛЕЛЬНО.
+-- =====================================================================
+
+-- Общая часть-принт: растёт ВНИЗ от точки baseOffset (верх конечности),
+-- верх прижат к конечности, сама часть приварена к attachTo.
+-- isCylinder = true -> цилиндр (трубчатая кость): ось X разворачивается вдоль конечности.
+local function bioPart(name, finalSize, color, material, duration, attachTo, baseOffset, transparency, isCylinder, limbTag)
+    local char = LocalPlayer.Character
+    if not char or not attachTo then return nil end
+
+    local part = Instance.new("Part")
+    part.Name = "QuantumBio_" .. name
+    part.Color = color
+    part.Material = material
+    part.Transparency = transparency or 0
+    part.CanCollide, part.CanTouch, part.CanQuery, part.Massless, part.Anchored = false, false, false, true, false
+
+    if isCylinder then
+        part.Shape = Enum.PartType.Cylinder
+        -- цилиндр растёт вдоль своей оси X: стартуем короткой "шайбой"
+        part.Size = Vector3.new(0.05, finalSize.Y, finalSize.Z)
+    else
+        -- старт: тонкая пластина у верхней точки, растёт вниз до finalSize
+        part.Size = Vector3.new(finalSize.X, 0.05, finalSize.Z)
+    end
+    part.Parent = char
+
+    local weld = Instance.new("Weld")
+    weld.Part0 = attachTo
+    weld.Part1 = part
+    if isCylinder then
+        -- верх цилиндра прижат к точке роста (baseOffset), рост идёт вниз
+        weld.C0 = baseOffset * CYL_ROT * CFrame.new(-part.Size.X / 2, 0, 0)
+    else
+        -- верх части прижат к точке роста (baseOffset), рост идёт вниз
+        weld.C0 = baseOffset * CFrame.new(0, -part.Size.Y / 2, 0)
+    end
+    weld.Parent = part
+
+    table.insert(getgenv().activePrinterParts, {
+        Instance = part,
+        Weld = weld,
+        BaseOffset = baseOffset,
+        Mode = isCylinder and "GrowCyl" or "Grow",
+        Limb = limbTag
+    })
+
+    TweenService:Create(
+        part,
+        TweenInfo.new(duration * config.RegenSpeed, Enum.EasingStyle.Sine, Enum.EasingDirection.Out),
+        {Size = finalSize}
+    ):Play()
+    return part
+end
+
+-- Деталь на растущей части: сидит на высоте frac по оси роста host-части
+-- (0.5 = верх, 0 = центр, -0.5 = низ). Появляется плавным проявлением.
+-- axis = "Y" (обычная часть) или "X" (кость-цилиндр).
+-- rot — поворот детали (для рёбер торса).
+local function bioNode(name, size, color, material, duration, host, frac, finalTransparency, isBall, axis, limbTag, rot)
+    local char = LocalPlayer.Character
+    if not char or not host then return nil end
+
+    local part = Instance.new("Part")
+    part.Name = "QuantumBio_" .. name
+    part.Color = color
+    part.Material = material
+    part.Transparency = 1
+    part.CanCollide, part.CanTouch, part.CanQuery, part.Massless, part.Anchored = false, false, false, true, false
+    if isBall then part.Shape = Enum.PartType.Ball end
+    part.Size = size
+    part.Parent = char
+
+    local weld = Instance.new("Weld")
+    weld.Part0 = host
+    weld.Part1 = part
+    rot = rot or CFrame.new()
+    if (axis or "Y") == "X" then
+        -- кость-цилиндр: ось роста = локальная X, верх = +X
+        weld.C0 = CFrame.new(host.Size.X * frac, 0, 0) * rot
+    else
+        weld.C0 = CFrame.new(0, host.Size.Y * frac, 0) * rot
+    end
+    weld.Parent = part
+
+    table.insert(getgenv().activePrinterParts, {
+        Instance = part,
+        Weld = weld,
+        Mode = "Node",
+        Host = host,
+        Frac = frac,
+        Axis = axis or "Y",
+        Rot = rot,
+        Limb = limbTag
+    })
+
+    TweenService:Create(
+        part,
+        TweenInfo.new(duration * config.RegenSpeed, Enum.EasingStyle.Sine, Enum.EasingDirection.Out),
+        {Transparency = finalTransparency or 0.15}
+    ):Play()
+    return part
+end
+
+-- НЕРВНО-СОСУДИСТАЯ СЕТЬ — как в реальной конечности: бледные нервные
+-- стволы с ганглиями, красные артерии, синие вены и россыпь капилляров.
+local function buildNerveSystem(anchorPart, boneLen, boneDiameter, bone, topOffset, limbTag)
+    local rNerve = boneDiameter / 2 + 0.05
+    local rBlood = boneDiameter / 2 + 0.03
+    local rCap   = boneDiameter / 2 + 0.06
+
+    -- 1) нервные стволы (бледные, тёплый оттенок) + утолщения-ганглии
+    local dirs = { {rNerve, rNerve}, {-rNerve, rNerve}, {rNerve, -rNerve}, {-rNerve, -rNerve} }
+    for i, d in ipairs(dirs) do
+        local s = bioPart(
+            "Nerve_" .. i,
+            Vector3.new(0.04, boneLen * 1.06, 0.04),
+            NERVE_COLOR,
+            Enum.Material.SmoothPlastic,
+            NERVE_FADE,
+            anchorPart,
+            topOffset * CFrame.new(d[1], 0, d[2]),
+            0,
+            false,
+            limbTag
+        )
+        if s then
+            bioNode("NerveNode", Vector3.new(0.085, 0.085, 0.085), NERVE_NODE_COLOR, Enum.Material.SmoothPlastic, NERVE_FADE, s, 0.25, 0, true, "Y", limbTag)
+            bioNode("NerveNode", Vector3.new(0.085, 0.085, 0.085), NERVE_NODE_COLOR, Enum.Material.SmoothPlastic, NERVE_FADE, s, -0.15, 0, true, "Y", limbTag)
+        end
+    end
+
+    -- 2) артерии: красные, ближе к кости
+    local arteryDirs = { {-rBlood, 0}, {rBlood * 0.7, rBlood * 0.7} }
+    for i, d in ipairs(arteryDirs) do
+        bioPart(
+            "Artery_" .. i,
+            Vector3.new(0.05, boneLen * 1.0, 0.05),
+            ARTERY_COLOR,
+            Enum.Material.SmoothPlastic,
+            NERVE_FADE,
+            anchorPart,
+            topOffset * CFrame.new(d[1], 0, d[2]),
+            0,
+            false,
+            limbTag
+        )
+    end
+
+    -- 3) вены: синие, тоже у кости
+    local veinDirs = { {0, -rBlood}, {-rBlood * 0.7, rBlood * 0.7} }
+    for i, d in ipairs(veinDirs) do
+        bioPart(
+            "Vein_" .. i,
+            Vector3.new(0.05, boneLen * 1.02, 0.05),
+            VEIN_COLOR,
+            Enum.Material.SmoothPlastic,
+            NERVE_FADE,
+            anchorPart,
+            topOffset * CFrame.new(d[1], 0, d[2]),
+            0,
+            false,
+            limbTag
+        )
+    end
+
+    -- 4) капилляры: МНОГО тонких струн, красные и синие вперемешку,
+    -- разной длины — органическая россыпь
+    for i = 1, 6 do
+        local angle = (i - 1) * math.pi / 3 + math.pi / 12
+        local capColor = (i % 2 == 0) and ARTERY_COLOR or VEIN_COLOR
+        bioPart(
+            "Capillary_" .. i,
+            Vector3.new(0.025, boneLen * (0.82 + (i % 3) * 0.09), 0.025),
+            capColor,
+            Enum.Material.SmoothPlastic,
+            NERVE_FADE,
+            anchorPart,
+            topOffset * CFrame.new(math.cos(angle) * rCap, 0, math.sin(angle) * rCap),
+            0,
+            false,
+            limbTag
+        )
+    end
+
+    -- 5) поперечные перемычки на кости (кость-цилиндр: ось X)
+    local barLen = rNerve * 2 + 0.1
+    bioNode("NerveBarX", Vector3.new(barLen, 0.03, 0.03), NERVE_COLOR, Enum.Material.SmoothPlastic, NERVE_FADE, bone, 0.2, 0, false, "X", limbTag)
+    bioNode("NerveBarX", Vector3.new(barLen, 0.03, 0.03), NERVE_COLOR, Enum.Material.SmoothPlastic, NERVE_FADE, bone, -0.1, 0, false, "X", limbTag)
+    bioNode("NerveBarZ", Vector3.new(0.03, 0.03, barLen), NERVE_COLOR, Enum.Material.SmoothPlastic, NERVE_FADE, bone, 0.05, 0, false, "X", limbTag)
+end
+
+-- Портальная вспышка: неоновый кокон вокруг части, разгорается и тает
+local function spawnPortalFlash(targetPart, color)
+    local char = LocalPlayer.Character
+    if not char or not targetPart then return end
+
+    local flash = Instance.new("Part")
+    flash.Name = "QuantumBio_PortalFlash"
+    flash.Color = color
+    flash.Material = Enum.Material.Neon
+    flash.Transparency = 0.45
+    flash.CanCollide, flash.CanTouch, flash.CanQuery, flash.Massless, flash.Anchored = false, false, false, true, false
+    flash.Size = targetPart.Size * 1.08
+    flash.Parent = char
+
+    local weld = Instance.new("Weld")
+    weld.Part0 = targetPart
+    weld.Part1 = flash
+    weld.Parent = flash
+
+    TweenService:Create(
+        flash,
+        TweenInfo.new(FLASH_TIME * config.RegenSpeed, Enum.EasingStyle.Sine, Enum.EasingDirection.Out),
+        {Transparency = 1, Size = targetPart.Size * 1.35}
+    ):Play()
+    task.delay(FLASH_TIME * config.RegenSpeed + 0.05, function()
+        if flash then flash:Destroy() end
+    end)
+end
+
+-- Кровавый взрыв: КРУПНЫЕ брызги насыщенно-красной крови вокруг точки.
+-- Летят по дуге и медленно тают — их реально видно.
+local function spawnBloodBurst(originCF, count)
+    for i = 1, count do
+        local blood = Instance.new("Part")
+        blood.Name = "QuantumBio_Blood"
+        blood.Color = BLOOD_COLOR
+        blood.Material = Enum.Material.SmoothPlastic
+        blood.Shape = Enum.PartType.Ball
+        blood.Size = Vector3.new(0.18, 0.18, 0.18) * (0.8 + math.random() * 1.4)
+        blood.CanCollide, blood.CanTouch, blood.CanQuery, blood.Massless, blood.Anchored = false, false, false, true, true
+        blood.CFrame = originCF * CFrame.new(
+            (math.random() - 0.5) * 0.5,
+            (math.random() - 0.5) * 0.5,
+            (math.random() - 0.5) * 0.5
+        )
+        blood.Parent = workspace
+
+        local angle = math.random() * math.pi * 2
+        local dist = 1.5 + math.random() * 3
+        local drop = 0.5 + math.random() * 2
+        local startPos = originCF.Position
+        local target = CFrame.new(startPos + Vector3.new(math.cos(angle) * dist, -drop, math.sin(angle) * dist))
+            * CFrame.Angles(math.random() * 6, math.random() * 6, math.random() * 6)
+        -- полёт по дуге
+        TweenService:Create(
+            blood,
+            TweenInfo.new(0.7 * config.RegenSpeed, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+            {CFrame = target}
+        ):Play()
+        -- медленное растворение (не сжимается — капля остаётся заметной)
+        TweenService:Create(
+            blood,
+            TweenInfo.new(1.6 * config.RegenSpeed, Enum.EasingStyle.Sine, Enum.EasingDirection.In),
+            {Transparency = 1}
+        ):Play()
+        task.delay(1.8 * config.RegenSpeed + 0.2, function()
+            if blood then blood:Destroy() end
+        end)
+    end
+end
+
+-- =====================================================================
+-- ПОСЛЕДОВАТЕЛЬНОСТЬ ПЕЧАТИ (универсальная: конечность или торс).
+-- Лимита «одна за раз» нет: группы печатаются ПАРАЛЛЕЛЬНО.
+-- Для торса кость-цилиндр читается как ПОЗВОНОЧНИК.
+-- =====================================================================
+local function runPrintSequence(limbName, parts)
+    setPrinterStatus("ПЕЧАТЬ: " .. limbName .. "...")
+
+    task.spawn(function()
+        local char = LocalPlayer.Character
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        if not char or not hum then
+            getgenv().busyLimbsRef[limbName] = false
+            setPrinterStatus("ОШИБКА: НЕТ ТЕЛА")
+            return
+        end
+
+        local anchorPart = parts[1]
+        local originalSize = anchorPart.Size
+        -- Точка роста: верх конечности (плечо/бедро). Всё печатается ОТ СЮДА ВНИЗ.
+        local topOffset = CFrame.new(0, originalSize.Y / 2, 0)
+        local speed = config.RegenSpeed
+
+        -- ЗВУК ГЕНЕРАЦИИ: замедляем трек ровно под длительность печати
+        -- (трек 1 сек → PlaybackSpeed 1/totalTime; на случай лагов — цикл)
+        local totalTime = (VANISH_TIME + BONE_FADE + NERVE_FADE + FLESH_FADE + SKIN_FADE + 0.1) * speed
+        local printSound = playSoundAt(anchorPart, PRINT_SOUND_ID, 1, math.clamp(1 / totalTime, 0.3, 1.25), true)
+
+        -- Свежий снимок кожи: берём ТЕКУЩИЙ цвет/материал прямо перед печатью
+        -- (захват при спавне мог быть серым дефолтом до прогрузки аватара).
+        for _, p in ipairs(parts) do
+            getgenv().originalDataRef[p] = {Color = p.Color, Material = p.Material, Transparency = p.Transparency}
+        end
+
+        -- ФАЗА 0: конечность уходит в портал (вспышка + исчезновение)
+        for _, p in ipairs(parts) do
+            p.Transparency = 1
+            spawnPortalFlash(p, COLOR_FLASH_IN)
+        end
+        task.wait(VANISH_TIME * speed)
+
+        -- ФАЗА 1: КОСТЬ — сплошной цилиндр (трубчатая кость)
+        local boneLen = originalSize.Y * 0.98
+        -- торсу — более мощный ПОЗВОНОЧНИК
+        local boneDiameter = math.min(originalSize.X, originalSize.Z) * ((limbName == "Torso") and 0.38 or 0.3)
+        local bone = bioPart(
+            "Bone",
+            Vector3.new(boneLen, boneDiameter, boneDiameter), -- цилиндр: (длина, Ø, Ø)
+            BONE_COLOR,
+            Enum.Material.Slate,
+            BONE_FADE,
+            anchorPart,
+            topOffset,
+            0,
+            true,
+            limbName
+        )
+        -- ТОРС: ГРУДНАЯ КЛЕТКА — 4 пары рёбер, растущих из позвоночника
+        -- вниз и в стороны (как настоящие рёбра)
+        if limbName == "Torso" and bone then
+            local ribLen = originalSize.X * 0.32
+            local ribFracs = {0.32, 0.12, -0.08, -0.28}
+            for _, f in ipairs(ribFracs) do
+                bioNode("Rib_R", Vector3.new(ribLen, 0.05, 0.04), BONE_COLOR, Enum.Material.Slate, BONE_FADE, bone, f, 0, false, "X", limbName, CFrame.Angles(0, 0, math.rad(-130)) * CFrame.new(ribLen / 2, 0, 0))
+                bioNode("Rib_L", Vector3.new(ribLen, 0.05, 0.04), BONE_COLOR, Enum.Material.Slate, BONE_FADE, bone, f, 0, false, "X", limbName, CFrame.Angles(0, 0, math.rad(130)) * CFrame.new(ribLen / 2, 0, 0))
+            end
+        end
+        setPrinterStatus("ПЕЧАТЬ: " .. limbName .. " // КОСТЬ")
+        task.wait(BONE_FADE * speed)
+
+        -- ФАЗА 2: НЕРВЫ — стволы, артерии, вены, капилляры
+        buildNerveSystem(anchorPart, boneLen, boneDiameter, bone, topOffset, limbName)
+        setPrinterStatus("ПЕЧАТЬ: " .. limbName .. " // НЕРВЫ")
+        task.wait(NERVE_FADE * speed)
+
+        -- ФАЗА 3: МЫШЦЫ — НЕПРОЗРАЧНАЯ красная плоть + яркие волокна,
+        -- чуть выступающие рельефом на поверхности (мышечные тяжи)
+        local fleshSize = originalSize * 0.96
+        bioPart("Flesh", fleshSize, FLESH_COLOR, Enum.Material.SmoothPlastic, FLESH_FADE, anchorPart, topOffset, 0, false, limbName)
+        local fiberR = fleshSize.X / 2 - 0.02
+        for i = 1, 4 do
+            local angle = (i - 1) * math.pi / 2 + math.pi / 4
+            bioPart(
+                "MuscleFiber_" .. i,
+                Vector3.new(0.07, fleshSize.Y * 0.97, 0.07),
+                FIBER_COLOR,
+                Enum.Material.SmoothPlastic,
+                FLESH_FADE,
+                anchorPart,
+                topOffset * CFrame.new(math.cos(angle) * fiberR, 0, math.sin(angle) * fiberR),
+                0,
+                false,
+                limbName
+            )
+        end
+        setPrinterStatus("ПЕЧАТЬ: " .. limbName .. " // МЫШЦЫ")
+        task.wait(FLESH_FADE * speed)
+
+        -- ФАЗА 4: КОЖА — цвет и МАТЕРИАЛ оригинальной конечности, часть за частью
+        for _, p in ipairs(parts) do
+            local orig = getgenv().originalDataRef[p]
+            if orig then
+                bioPart(
+                    "Skin",
+                    p.Size * 1.01,
+                    orig.Color,
+                    orig.Material or Enum.Material.SmoothPlastic,
+                    SKIN_FADE,
+                    p,
+                    CFrame.new(0, p.Size.Y / 2, 0),
+                    0,
+                    false,
+                    limbName
+                )
+            end
+        end
+        setPrinterStatus("ПЕЧАТЬ: " .. limbName .. " // КОЖА")
+        task.wait((SKIN_FADE + 0.1) * speed)
+
+        -- ФИНАЛ: сносим ТОЛЬКО СВОИ части принта (параллельные регенерации не трогаем)
+        local list = getgenv().activePrinterParts
+        for i = #list, 1, -1 do
+            if list[i].Limb == limbName then
+                if list[i].Instance then list[i].Instance:Destroy() end
+                table.remove(list, i)
+            end
+        end
+
+        -- звук генерации — стоп
+        if printSound then
+            printSound:Stop()
+            printSound:Destroy()
+        end
+
+        for _, p in ipairs(parts) do
+            p.Transparency = 0
+            spawnPortalFlash(p, COLOR_FLASH_OUT)
+        end
+
+        getgenv().busyLimbsRef[limbName] = false
+        setPrinterStatus("ГОТОВО // " .. limbName)
+        task.delay(1.5, function()
+            if #getgenv().activePrinterParts == 0 and not getgenv().ShatterActive then
+                setPrinterStatus("ОЖИДАНИЕ")
+            end
+        end)
+    end)
+end
+
+-- Конечность: регенерируется при уроне (и после распада)
+getgenv().regenerateLimb = function(limbName)
+    if getgenv().busyLimbsRef[limbName] then return end
+    local char = LocalPlayer.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if not hum then return end
+    local limbTable = (hum.RigType == Enum.HumanoidRigType.R6) and R6_LIMBS or R15_LIMBS
+    local partsInOrder = limbTable[limbName]
+    if not partsInOrder then return end
+    local parts = {}
+    for _, name in ipairs(partsInOrder) do
+        local p = char:FindFirstChild(name)
+        if p then table.insert(parts, p) end
+    end
+    if #parts == 0 then return end
+    getgenv().busyLimbsRef[limbName] = true
+    runPrintSequence(limbName, parts)
+end
+
+-- Торс: регенерируется ТОЛЬКО после распада на части (при уроне НЕ вызывается)
+getgenv().regenerateTorso = function()
+    if getgenv().busyLimbsRef["Torso"] then return end
+    local char = LocalPlayer.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if not hum then return end
+    local partsInOrder = (hum.RigType == Enum.HumanoidRigType.R6) and TORSO_PARTS.R6 or TORSO_PARTS.R15
+    local parts = {}
+    for _, name in ipairs(partsInOrder) do
+        local p = char:FindFirstChild(name)
+        if p then table.insert(parts, p) end
+    end
+    if #parts == 0 then return end
+    getgenv().busyLimbsRef["Torso"] = true
+    runPrintSequence("Torso", parts)
+end
+
+-- =====================================================================
+-- РАСПАД НА ЧАСТИ: тело разлетается с кровью (настоящая физика — куски
+-- ПАДАЮТ на землю), происходит РЕСЕТ (смерть+респавн), персонаж
+-- ВОЗРОЖДАЕТСЯ НА ТОМ ЖЕ МЕСТЕ, где распался, и полностью регенерирует:
+-- торс + все 4 конечности.
+-- =====================================================================
+getgenv().shatterBody = function()
+    if getgenv().ShatterActive then return end
+    local char = LocalPlayer.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    if not char or not hum or not root or hum.Health <= 0 then return end
+
+    getgenv().ShatterActive = true
+    setPrinterStatus("💥 РАСПАД НА ЧАСТИ...")
+
+    task.spawn(function()
+        local deathCF = root.CFrame -- запоминаем ГДЕ распались
+        local rootPos = root.Position
+
+        -- ЗВУК РАСПАДА
+        playSoundAt(root, SHATTER_SOUND_ID, 2, 1, false)
+
+        -- 1) ФИЗИЧЕСКИЕ копии всех видимых частей: разлетаются с брызгами крови
+        --    и САМИ ПАДАЮТ на землю (настоящая физика, без левитации)
+        local clones = {}
+        for _, obj in ipairs(char:GetDescendants()) do
+            if obj:IsA("BasePart") and obj.Name ~= "HumanoidRootPart" and obj.Transparency < 1 then
+                local clone = obj:Clone()
+                for _, c in ipairs(clone:GetChildren()) do
+                    if c:IsA("Motor6D") or c:IsA("JointInstance") then c:Destroy() end
+                end
+                clone.Anchored = false
+                clone.CanCollide, clone.CanTouch, clone.CanQuery, clone.Massless = true, false, false, true
+                clone.Parent = workspace
+                local dir = obj.Position - rootPos
+                if dir.Magnitude < 0.05 then
+                    dir = Vector3.new(math.random() - 0.5, 0.5, math.random() - 0.5)
+                end
+                dir = dir.Unit
+                clone.AssemblyLinearVelocity = dir * (15 + math.random() * 15) + Vector3.new(0, 10 + math.random() * 12, 0)
+                clone.AssemblyAngularVelocity = Vector3.new(math.random() * 24 - 12, math.random() * 24 - 12, math.random() * 24 - 12)
+                table.insert(clones, clone)
+                spawnBloodBurst(obj.CFrame, 6)
+            end
+        end
+
+        -- 2) прячем настоящее тело и снимаем коллизии,
+        --    чтобы невидимый труп не мешал разлетевшимся кускам
+        for _, obj in ipairs(char:GetDescendants()) do
+            if obj:IsA("BasePart") then
+                obj.Transparency = 1
+                obj.CanCollide = false
+            elseif obj:IsA("Decal") then
+                obj.Transparency = 1
+            end
+        end
+
+        -- 3) РЕСЕТ: убиваем персонажа — игра делает респавн сама
+        setPrinterStatus("ОЖИДАНИЕ РЕСПАВНА...")
+        hum.Health = 0
+        hum:ChangeState(Enum.HumanoidStateType.Dead)
+
+        -- 4) ждём новое тело и ПЕРЕНОСИМ ЕГО НА МЕСТО РАСПАДА
+        local newChar = nil
+        local gotRespawn = false
+        local respawnConn = LocalPlayer.CharacterAdded:Connect(function(c)
+            newChar = c
+            gotRespawn = true
+        end)
+        local t0 = os.clock()
+        while not gotRespawn and os.clock() - t0 < 15 do
+            task.wait(0.1)
+        end
+        respawnConn:Disconnect()
+
+        if newChar then
+            local newRoot = newChar:WaitForChild("HumanoidRootPart", 10)
+            if newRoot then
+                task.wait(0.2)
+                newRoot.CFrame = deathCF -- возвращаемся ГДЕ РАСПАЛИСЬ
+                task.wait(0.25)
+                newRoot.CFrame = deathCF -- повторно: если игра телепортнула на спавн
+                spawnPortalFlash(newRoot, COLOR_FLASH_OUT)
+            end
+        end
+
+        -- 5) убираем разлетевшиеся куски
+        for _, clone in ipairs(clones) do
+            if clone and clone.Parent then clone:Destroy() end
+        end
+
+        if not newChar then
+            setPrinterStatus("РЕСПАВН НЕ ПРИШЁЛ (АВТО-РЕСПАВН ВЫКЛЮЧЕН?)")
+            getgenv().ShatterActive = false
+            return
+        end
+        setPrinterStatus("ТЕЛО ВОССТАНОВЛЕНО // ПОЛНАЯ РЕГЕНЕРАЦИЯ")
+
+        -- 6) полная регенерация: ТОРС + 4 конечности (параллельно, со сдвигом старта)
+        for i, limbName in ipairs({"Torso", "RightArm", "LeftArm", "RightLeg", "LeftLeg"}) do
+            task.delay(0.25 * (i - 1), function()
+                getgenv().busyLimbsRef[limbName] = false
+                if limbName == "Torso" then
+                    if getgenv().regenerateTorso then getgenv().regenerateTorso() end
+                else
+                    if getgenv().regenerateLimb then getgenv().regenerateLimb(limbName) end
+                end
+            end)
+        end
+
+        getgenv().ShatterActive = false
+    end)
+end
+
+local function pickRandomFreeLimb()
+    local char = LocalPlayer.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if not hum then return nil end
+    local limbTable = (hum.RigType == Enum.HumanoidRigType.R6) and R6_LIMBS or R15_LIMBS
+    local free = {}
+    for name in pairs(limbTable) do
+        if not getgenv().busyLimbsRef[name] then table.insert(free, name) end
+    end
+    if #free == 0 then return nil end
+    return free[math.random(1, #free)]
+end
+
+local function setupCharacter(character)
+    local hum = character:WaitForChild("Humanoid", 10)
+    if not hum then return end
+    local limbTable = (hum.RigType == Enum.HumanoidRigType.R6) and R6_LIMBS or R15_LIMBS
+    for _, parts in pairs(limbTable) do
+        for _, partName in ipairs(parts) do
+            local p = character:WaitForChild(partName, 5)
+            if p then
+                getgenv().originalDataRef[p] = {Color = p.Color, Material = p.Material, Transparency = p.Transparency}
+            end
+        end
+    end
+
+    -- применяем скорость ОДИН раз при спавне (спринт игры больше не блокируется)
+    hum.WalkSpeed = config.WalkSpeedValue
+
+    local previousHealth = hum.Health
+    track(hum.HealthChanged:Connect(function(newHealth)
+        -- АВТО-РАСПАД при низком ХП
+        if config.AutoShatter and getgenv().shatterBody
+            and newHealth > 0 and newHealth <= config.ShatterHP
+            and not getgenv().ShatterActive then
+            getgenv().shatterBody()
+        end
+        -- АВТО-РЕГЕН при уроне: лимита нет — каждая пуля может запустить свою конечность
+        if newHealth < previousHealth and newHealth > 0 and config.AutoRegen then
+            local limb = pickRandomFreeLimb()
+            if limb and getgenv().regenerateLimb then
+                getgenv().regenerateLimb(limb)
+            end
+        end
+        previousHealth = newHealth
+    end))
+end
+
+if LocalPlayer.Character then setupCharacter(LocalPlayer.Character) end
+track(LocalPlayer.CharacterAdded:Connect(setupCharacter))
+
+-- Heartbeat: ТОЛЬКО доводка Weld'ов (верх принта прижат к конечности,
+-- часть растёт вниз; утолщения нервов скользят по растущим стволам).
+-- ВАЖНО: WalkSpeed здесь больше не трогаем — иначе ломается спринт на Shift!
+track(RunService.Heartbeat:Connect(function()
+    local list = getgenv().activePrinterParts
+    if #list > 0 then
+        for _, data in ipairs(list) do
+            local inst = data.Instance
+            if inst and inst.Parent and data.Weld then
+                if data.Mode == "Grow" then
+                    data.Weld.C0 = data.BaseOffset * CFrame.new(0, -inst.Size.Y / 2, 0)
+                elseif data.Mode == "GrowCyl" then
+                    data.Weld.C0 = data.BaseOffset * CYL_ROT * CFrame.new(-inst.Size.X / 2, 0, 0)
+                elseif data.Mode == "Node" and data.Host and data.Host.Parent then
+                    local rot = data.Rot or CFrame.new()
+                    if data.Axis == "X" then
+                        -- кость-цилиндр: ось роста = локальная X, верх = +X
+                        data.Weld.C0 = CFrame.new(data.Host.Size.X * data.Frac, 0, 0) * rot
+                    else
+                        data.Weld.C0 = CFrame.new(0, data.Host.Size.Y * data.Frac, 0) * rot
+                    end
+                end
+            end
+        end
+    end
+end))
+
+-- ===================== RICK PRIME GUI =====================
+
+local mG = Instance.new("ScreenGui", CoreGui)
+mG.Name = "MonoPortalGunGui"
+
+local mF = Instance.new("Frame", mG)
+mF.Size, mF.Position = UDim2.new(0, 300, 0, 380), UDim2.new(0, 60, 0, 160)
+mF.BackgroundColor3, mF.BorderSizePixel, mF.BorderColor3 = COLOR_BG, 0, COLOR_NEON
+mF.Active, mF.Draggable = true, true
+mF.ClipsDescendants = false
+Instance.new("UICorner", mF).CornerRadius = UDim.new(0, 10)
+local mFStroke = Instance.new("UIStroke", mF)
+mFStroke.Color, mFStroke.Thickness, mFStroke.Transparency = COLOR_NEON, 1.5, 0.35
+
+-- Хедер
+local header = Instance.new("Frame", mF)
+header.Size, header.Position, header.BackgroundColor3, header.BorderSizePixel = UDim2.new(1, 0, 0, 44), UDim2.new(0, 0, 0, 0), COLOR_HEADER, 0
+header.ZIndex = 2
+Instance.new("UICorner", header).CornerRadius = UDim.new(0, 10)
+
+-- КРАСНАЯ линия Prime — «злой» акцент под шапкой
+local primeLine = Instance.new("Frame", mF)
+primeLine.Size, primeLine.Position, primeLine.BackgroundColor3, primeLine.BorderSizePixel, primeLine.ZIndex =
+    UDim2.new(1, 0, 0, 2), UDim2.new(0, 0, 0, 44), COLOR_PRIME_RED, 0, 3
+
+local title = Instance.new("TextLabel", mF)
+title.Size, title.Position, title.BackgroundTransparency = UDim2.new(1, -60, 0, 22), UDim2.new(0, 14, 0, 4), 1
+title.Text, title.TextColor3, title.Font, title.TextSize, title.TextXAlignment, title.ZIndex =
+    "◈ RICK PRIME BIOPRINTER", COLOR_NEON, Enum.Font.Code, 12, Enum.TextXAlignment.Left, 3
+
+local subtitle = Instance.new("TextLabel", mF)
+subtitle.Size, subtitle.Position, subtitle.BackgroundTransparency = UDim2.new(1, -60, 0, 14), UDim2.new(0, 14, 0, 24), 1
+subtitle.Text, subtitle.TextColor3, subtitle.Font, subtitle.TextSize, subtitle.TextXAlignment, subtitle.ZIndex =
+    "RICK PRIME // DARK PROTOCOL // v65.0", Color3.fromRGB(255, 70, 70), Enum.Font.Code, 8, Enum.TextXAlignment.Left, 3
+
+-- Пульсация заголовка (портальное свечение)
+TweenService:Create(title, TweenInfo.new(1.2, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true),
+    {TextColor3 = Color3.fromRGB(255, 130, 130)}):Play()
+
+-- Закрытие
+local close = Instance.new("TextButton", mF)
+close.Size, close.Position, close.BackgroundColor3, close.BorderSizePixel = UDim2.new(0, 22, 0, 22), UDim2.new(1, -30, 0, 11), COLOR_PANEL, 0
+close.Text, close.TextColor3, close.Font, close.TextSize, close.ZIndex = "✕", COLOR_NEON, Enum.Font.Code, 12, 4
+close.BorderColor3 = COLOR_NEON_DIM
+Instance.new("UICorner", close).CornerRadius = UDim.new(0, 6)
+close.MouseButton1Click:Connect(function()
+    mG:Destroy()
+    for _, conn in ipairs(getgenv().MonoConnections) do
+        if conn.Connected then conn:Disconnect() end
+    end
+    table.clear(getgenv().MonoConnections)
+    getgenv().PrinterStatusCallback = nil
+end)
+
+-- Строка статуса печати
+local statusDot = Instance.new("Frame", mF)
+statusDot.Size, statusDot.Position, statusDot.BackgroundColor3, statusDot.BorderSizePixel = UDim2.new(0, 8, 0, 8), UDim2.new(0, 14, 0, 54), COLOR_NEON, 0
+statusDot.ZIndex = 3
+Instance.new("UICorner", statusDot).CornerRadius = UDim.new(1, 0)
+TweenService:Create(statusDot, TweenInfo.new(0.8, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true),
+    {BackgroundTransparency = 0.6}):Play()
+
+local statusLabel = Instance.new("TextLabel", mF)
+statusLabel.Size, statusLabel.Position, statusLabel.BackgroundTransparency = UDim2.new(1, -30, 0, 14), UDim2.new(0, 30, 0, 51), 1
+statusLabel.Text, statusLabel.TextColor3, statusLabel.Font, statusLabel.TextSize, statusLabel.TextXAlignment, statusLabel.ZIndex =
+    "▮ СТАТУС: ОЖИДАНИЕ", COLOR_TEXT, Enum.Font.Code, 9, Enum.TextXAlignment.Left, 3
+
+getgenv().PrinterStatusCallback = function(text)
+    statusLabel.Text = "▮ СТАТУС: " .. text
+    if string.find(text, "РАСПАД") or string.find(text, "РЕСПАВН") or string.find(text, "ОШИБКА") then
+        statusDot.BackgroundColor3 = Color3.fromRGB(255, 255, 255) -- распад: белый сигнал
+    else
+        statusDot.BackgroundColor3 = (text == "ОЖИДАНИЕ") and COLOR_NEON_DIM or COLOR_NEON
+    end
+end
+
+-- Область контента
+local content = Instance.new("Frame", mF)
+content.Size, content.Position, content.BackgroundTransparency, content.ZIndex =
+    UDim2.new(1, -24, 1, -96), UDim2.new(0, 12, 0, 72), 1, 2
+
+local function mkCorner(obj, r)
+    Instance.new("UICorner", obj).CornerRadius = UDim.new(0, r)
+end
+
+local function mkButton(txt, y, cb)
+    local b = Instance.new("TextButton", content)
+    b.Size, b.Position, b.BackgroundColor3, b.BorderSizePixel, b.BorderColor3, b.ZIndex =
+        UDim2.new(1, 0, 0, 32), UDim2.new(0, 0, 0, y), COLOR_PANEL, 0, COLOR_NEON_DIM, 3
+    b.Text, b.TextColor3, b.Font, b.TextSize = txt, COLOR_TEXT, Enum.Font.Code, 9
+    mkCorner(b, 6)
+    local stroke = Instance.new("UIStroke", b)
+    stroke.Color, stroke.Thickness, stroke.Transparency = COLOR_NEON_DIM, 1, 0.5
+    b.MouseButton1Click:Connect(function() cb(b) end)
+    return b
+end
+
+mkButton("▶ ЗАПУСТИТЬ БИОПЕЧАТЬ (СЛУЧАЙНАЯ КОНЕЧНОСТЬ)", 0, function(b)
+    local limb = pickRandomFreeLimb()
+    if limb then
+        getgenv().regenerateLimb(limb)
+    else
+        statusLabel.Text = "▮ СТАТУС: ВСЕ КОНЕЧНОСТИ ЗАНЯТЫ"
+    end
+end)
+
+-- Тумблеры
+local function mkToggle(txtOn, txtOff, y, getVal, setVal)
+    local btn = Instance.new("TextButton", content)
+    btn.Size, btn.Position, btn.BackgroundColor3, btn.BorderSizePixel, btn.ZIndex =
+        UDim2.new(1, 0, 0, 30), UDim2.new(0, 0, 0, y), COLOR_PANEL, 0, 3
+    mkCorner(btn, 6)
+    local stroke = Instance.new("UIStroke", btn)
+    stroke.Color, stroke.Thickness, stroke.Transparency = COLOR_NEON_DIM, 1, 0.5
+    local function refresh()
+        local on = getVal()
+        btn.Text = on and txtOn or txtOff
+        btn.TextColor3 = on and COLOR_NEON or Color3.fromRGB(150, 150, 152)
+        stroke.Color = on and COLOR_NEON or Color3.fromRGB(95, 80, 80)
+        btn.BackgroundColor3 = on and Color3.fromRGB(45, 12, 14) or COLOR_PANEL
+    end
+    btn.TextColor3, btn.Font, btn.TextSize = COLOR_TEXT, Enum.Font.Code, 9
+    btn.MouseButton1Click:Connect(function()
+        setVal(not getVal())
+        refresh()
+    end)
+    refresh()
+    return btn
+end
+
+mkToggle("[◉ ВКЛ]  АВТО-РЕГЕН ПРИ УРОНЕ (БЕЗ ЛИМИТА)", "[○ ВЫКЛ]  АВТО-РЕГЕН ПРИ УРОНЕ (БЕЗ ЛИМИТА)",
+    40, function() return config.AutoRegen end, function(v) config.AutoRegen = v end)
+
+mkButton("💥 РАСПАД НА ЧАСТИ + РЕСЕТ НА МЕСТЕ (ТЕСТ)", 78, function()
+    if getgenv().ShatterActive then
+        statusLabel.Text = "▮ СТАТУС: ТЕЛО УЖЕ РАСПАДАЕТСЯ"
+        return
+    end
+    getgenv().shatterBody()
+end)
+
+mkToggle("[◉ ВКЛ]  АВТО-РАСПАД ПРИ НИЗКОМ ХП", "[○ ВЫКЛ]  АВТО-РАСПАД ПРИ НИЗКОМ ХП",
+    118, function() return config.AutoShatter end, function(v) config.AutoShatter = v end)
+
+-- Слайдеры
+local activeSliders = {}
+
+local function createSlider(text, y, min, max, default, isInt, cb)
+    local titleS = Instance.new("TextLabel", content)
+    titleS.Size, titleS.Position, titleS.BackgroundTransparency, titleS.ZIndex =
+        UDim2.new(1, 0, 0, 14), UDim2.new(0, 4, 0, y), 1, 3
+    titleS.TextColor3, titleS.Font, titleS.TextSize, titleS.TextXAlignment = COLOR_NEON, Enum.Font.Code, 9, Enum.TextXAlignment.Left
+    titleS.Text = text .. " -> " .. (isInt and string.format("%d", default) or string.format("%.1f", default)) .. (isInt and "" or "x")
+
+    local line = Instance.new("Frame", content)
+    line.Size, line.Position, line.BackgroundColor3, line.BorderSizePixel, line.ZIndex =
+        UDim2.new(1, -8, 0, 3), UDim2.new(0, 4, 0, y + 19), Color3.fromRGB(40, 12, 12), 0, 4
+    mkCorner(line, 3)
+
+    local fill = Instance.new("Frame", line)
+    fill.Size, fill.BackgroundColor3, fill.BorderSizePixel, fill.ZIndex =
+        UDim2.new(math.clamp((default - min) / (max - min), 0, 1), 0, 1, 0), COLOR_NEON, 0, 5
+    mkCorner(fill, 3)
+
+    local dot = Instance.new("TextButton", content)
+    dot.Size = UDim2.fromOffset(10, 10)
+    dot.BackgroundColor3, dot.BorderSizePixel, dot.Text, dot.ZIndex = COLOR_NEON, 0, "", 6
+    Instance.new("UICorner", dot).CornerRadius = UDim.new(1, 0)
+    local initPct = math.clamp((default - min) / (max - min), 0, 1)
+    dot.Position = UDim2.new(0, 4 + (initPct * 258), 0, y + 15) -- 258 = ширина трека (268) минус диаметр точки (10)
+
+    local sliderData = {
+        Dragging = false, Button = dot, Bar = fill, BG = line,
+        Min = min, Max = max, Title = titleS, Text = text,
+        IsInt = isInt, Callback = cb, YCoord = y + 15
+    }
+    table.insert(activeSliders, sliderData)
+
+    dot.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            sliderData.Dragging = true
+        end
+    end)
+end
+
+track(UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        for _, slider in ipairs(activeSliders) do slider.Dragging = false end
+    end
+end))
+
+track(UserInputService.InputChanged:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+        for _, slider in ipairs(activeSliders) do
+            if slider.Dragging then
+                local pct = math.clamp((input.Position.X - slider.BG.AbsolutePosition.X) / slider.BG.AbsoluteSize.X, 0, 1)
+                slider.Button.Position = UDim2.new(0, 4 + (pct * (slider.BG.AbsoluteSize.X - 10)), 0, slider.YCoord)
+                slider.Bar.Size = UDim2.new(pct, 0, 1, 0)
+                local value = slider.Min + (pct * (slider.Max - slider.Min))
+                if slider.IsInt then
+                    value = math.floor(value)
+                    slider.Title.Text = slider.Text .. " -> " .. string.format("%d", value)
+                else
+                    slider.Title.Text = slider.Text .. " -> " .. string.format("%.1f", value) .. "x"
+                end
+                slider.Callback(value)
+            end
+        end
+    end
+end))
+
+createSlider("ЗАМЕДЛЕНИЕ СКОРОСТИ ПЕЧАТИ", 158, 1, 8, config.RegenSpeed, false, function(v)
+    config.RegenSpeed = v
+end)
+
+createSlider("СКОРОСТЬ ПЕРЕМЕЩЕНИЯ РИКА", 204, 16, 150, config.WalkSpeedValue, true, function(v)
+    config.WalkSpeedValue = math.floor(v)
+    -- применяем СРАЗУ при изменении слайдера (не каждый кадр — спринт не ломаем)
+    local char = LocalPlayer.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if hum and hum.Health > 0 then
+        hum.WalkSpeed = config.WalkSpeedValue
+    end
+end)
+
+createSlider("ПОРОГ ХП ДЛЯ АВТО-РАСПАДА", 250, 5, 100, config.ShatterHP, true, function(v)
+    config.ShatterHP = math.floor(v)
+end)
+
+-- Футер
+local footer = Instance.new("TextLabel", mF)
+footer.Size, footer.Position, footer.BackgroundTransparency = UDim2.new(1, -20, 0, 16), UDim2.new(0, 10, 1, -22), 1
+footer.Text, footer.TextColor3, footer.Font, footer.TextSize, footer.TextXAlignment, footer.ZIndex =
+    "MONOCHROME_PREMIUM // PRIME PROTOCOL", Color3.fromRGB(180, 30, 30), Enum.Font.Code, 7, Enum.TextXAlignment.Right, 3
+
+print("[MONO]: Rick Prime BioPrinter v65.0 // DARK PROTOCOL активирован. РАСПАД ГОТОВ.")
